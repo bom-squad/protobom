@@ -21,6 +21,10 @@ const (
 	stateKey state = "cyclonedx_serializer_state"
 )
 
+var (
+	emptyRoot = cdx.Component{}
+)
+
 type (
 	state string
 	CDX   struct {
@@ -36,7 +40,7 @@ func NewCDX(version, encoding string) *CDX {
 	}
 }
 
-func (s *CDX) Serialize(bom *sbom.Document, _ *native.SerializeOptions, _ interface{}) (interface{}, error) {
+func (s *CDX) Serialize(bom *sbom.Document, options *native.SerializeOptions, _ interface{}) (interface{}, error) {
 	// Load the context with the CDX value. We initialize a context here
 	// but we should get it as part of the method to capture cancelations
 	// from the CLI or REST API.
@@ -71,21 +75,22 @@ func (s *CDX) Serialize(bom *sbom.Document, _ *native.SerializeOptions, _ interf
 		return nil, fmt.Errorf("unable to build cyclonedx document, no root nodes found")
 	}
 
-	// .. or has too many root elements:
-
-	// TODO(deprecation): If there are more root nodes we need to hack them
-	// into the CycloneDX graph or error
-	if l := len(bom.NodeList.RootElements); l > 1 {
-		return nil, fmt.Errorf("unable to serialize multiroot cyclonedx, document has %d root nodes", l)
+	var selectedRoots []string
+	if options.SelectRoots != nil {
+		selectedRoots, err = options.SelectRoots(ctx, bom)
+	} else {
+		selectedRoots, err = selectRootsCdx(ctx, bom)
+	}
+	if err != nil {
+		return nil, err
+	}
+	bom.NodeList.RootElements = selectedRoots
+	root, err := s.root(ctx, bom)
+	if err != nil {
+		return nil, err
 	}
 
-	rootNode := bom.NodeList.GetNodeByID(bom.NodeList.RootElements[0])
-	if rootNode == nil {
-		return nil, fmt.Errorf("integrity error: root node %q not found", bom.NodeList.RootElements[0])
-	}
-
-	doc.Metadata.Component = s.nodeToComponent(rootNode)
-	state.addedDict[rootNode.Id] = struct{}{}
+	doc.Metadata.Component = root
 
 	if err := s.componentsMaps(ctx, bom); err != nil {
 		return nil, err
@@ -149,6 +154,39 @@ func (s *CDX) Serialize(bom *sbom.Document, _ *native.SerializeOptions, _ interf
 	return doc, nil
 }
 
+func selectRootsCdx(ctx context.Context, bom *sbom.Document) ([]string, error) {
+	var selectedRoots []string
+	roots := bom.NodeList.GetRootElements()
+	switch len(roots) {
+	case 0:
+		return selectedRoots, fmt.Errorf("no root provided")
+	case 1:
+		selectedRoots = append(selectedRoots, roots[0])
+	default:
+		// Leave root empty will push all roots as components.
+	}
+
+	return selectedRoots, nil
+}
+
+func (s *CDX) root(ctx context.Context, bom *sbom.Document) (*cdx.Component, error) {
+	if len(bom.NodeList.GetRootElements()) > 1 {
+		return nil, fmt.Errorf("CDX can only include a single root")
+	}
+
+	if len(bom.NodeList.GetRootElements()) > 0 {
+		id := bom.NodeList.GetRootElements()[0]
+		rootNode := bom.NodeList.GetNodeByID(id)
+		if rootNode == nil {
+			return nil, fmt.Errorf("integrity error: root node %q not found", bom.NodeList.RootElements[0])
+		}
+		rootsComp := s.nodeToComponent(rootNode)
+		return rootsComp, nil
+	} else {
+		return &emptyRoot, nil
+	}
+}
+
 // sbomTypeToPhase converts a SBOM document type to a CDX lifecycle phase
 func sbomTypeToPhase(dt *sbom.DocumentType) (cdx.LifecyclePhase, error) {
 	switch *dt.Type {
@@ -204,9 +242,9 @@ func (s *CDX) componentsMaps(ctx context.Context, bom *sbom.Document) error {
 			// Error? Warn?
 			continue
 		}
-
 		state.componentsDict[comp.BOMRef] = comp
 	}
+
 	return nil
 }
 
